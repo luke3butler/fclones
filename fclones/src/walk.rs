@@ -1,6 +1,7 @@
 use std::default::Default;
 use std::env::current_dir;
 use std::fs::{read_link, symlink_metadata, DirEntry, FileType, ReadDir};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::{fs, io};
 
@@ -147,6 +148,8 @@ pub struct Walk<'a> {
     pub on_visit: &'a (dyn Fn(&Path) + Sync + Send),
     /// Warnings about inaccessible files or dirs are logged here, if defined.
     pub log: Option<&'a dyn Log>,
+    /// Cancellation token for cooperative cancellation.
+    pub cancel_token: Option<Arc<AtomicBool>>,
 }
 
 /// Private shared state scoped to a single `run` invocation.
@@ -170,7 +173,16 @@ impl<'a> Walk<'a> {
             path_selector: PathSelector::new(base_dir),
             on_visit: &|_| {},
             log: None,
+            cancel_token: None,
         }
+    }
+
+    /// Check if cancellation has been requested
+    fn is_cancelled(&self) -> bool {
+        self.cancel_token
+            .as_ref()
+            .map(|t| t.load(Ordering::SeqCst))
+            .unwrap_or(false)
     }
 
     /// Walks multiple directories recursively in parallel and sends found files to `consumer`.
@@ -272,6 +284,11 @@ impl<'a> Walk<'a> {
         F: Fn(Path) + Sync + Send,
         's: 'w,
     {
+        // Check for cancellation
+        if self.is_cancelled() {
+            return;
+        }
+
         // For progress reporting
         (self.on_visit)(&entry.path);
 
@@ -373,6 +390,10 @@ impl<'a> Walk<'a> {
         match fs::read_dir(path.to_path_buf()) {
             Ok(rd) => {
                 for entry in Self::sorted_entries(path, rd) {
+                    // Check for cancellation before spawning more work
+                    if self.is_cancelled() {
+                        return;
+                    }
                     let gitignore = gitignore.clone();
                     scope.spawn(move |s| {
                         self.visit_entry(entry, dev, s, level + 1, gitignore, state)

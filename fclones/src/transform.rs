@@ -468,7 +468,7 @@ mod test {
             drop(input);
 
             let log = StdLog::default();
-            let hasher = FileHasher::new(HashFn::default(), Some(transform), &log);
+            let hasher = FileHasher::new(HashFn::default(), Some(transform), &log, None);
             let input_path = Path::from(input_path);
             let chunk = FileChunk::new(&input_path, FilePos(0), FileLen::MAX);
             let good_file_hash = hasher.hash_file(&chunk, |_| {}).unwrap();
@@ -490,7 +490,7 @@ mod test {
             drop(input);
 
             let log = StdLog::default();
-            let hasher = FileHasher::new(HashFn::default(), Some(transform), &log);
+            let hasher = FileHasher::new(HashFn::default(), Some(transform), &log, None);
             let input_path = Path::from(input_path);
 
             let chunk = FileChunk::new(&input_path, FilePos(0), FileLen::MAX);

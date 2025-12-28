@@ -7,6 +7,7 @@ use std::io;
 use std::io::{stdin, BufRead, BufReader, ErrorKind};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use chrono::{DateTime, FixedOffset, Local};
@@ -371,9 +372,22 @@ pub struct GroupConfig {
     /// limit is specified with `--depth`.
     #[arg(required_unless_present("stdin"))]
     pub paths: Vec<Path>,
+
+    /// Cancellation token for cooperative cancellation.
+    /// When set to true, the scan will stop as soon as possible.
+    #[arg(skip)]
+    pub cancel_token: Option<Arc<AtomicBool>>,
 }
 
 impl GroupConfig {
+    /// Check if cancellation has been requested
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel_token
+            .as_ref()
+            .map(|t| t.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(false)
+    }
+
     fn validate(&self) -> Result<(), String> {
         if self.isolate && self.paths.len() <= self.rf_over() {
             return Err(format!(

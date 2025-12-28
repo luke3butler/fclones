@@ -5,6 +5,8 @@ use std::hash::Hasher;
 use std::io;
 use std::io::{Read, Seek};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use metrohash::MetroHash128;
 use serde::{Deserialize, Serialize};
@@ -210,17 +212,24 @@ pub struct FileHasher<'a> {
     pub(crate) cache: Option<HashCache>,
     pub(crate) transform: Option<Transform>,
     pub(crate) log: &'a dyn Log,
+    pub(crate) cancel_token: Option<Arc<AtomicBool>>,
 }
 
 impl FileHasher<'_> {
     /// Creates a hasher with no caching
-    pub fn new(algorithm: HashFn, transform: Option<Transform>, log: &dyn Log) -> FileHasher<'_> {
+    pub fn new(
+        algorithm: HashFn,
+        transform: Option<Transform>,
+        log: &dyn Log,
+        cancel_token: Option<Arc<AtomicBool>>,
+    ) -> FileHasher<'_> {
         FileHasher {
             algorithm,
             buf_len: 65536,
             cache: None,
             transform,
             log,
+            cancel_token,
         }
     }
 
@@ -229,6 +238,7 @@ impl FileHasher<'_> {
         algorithm: HashFn,
         transform: Option<Transform>,
         log: &dyn Log,
+        cancel_token: Option<Arc<AtomicBool>>,
     ) -> Result<FileHasher<'_>, Error> {
         let transform_command_str = transform.as_ref().map(|t| t.command_str.as_str());
         let cache = HashCache::open_default(transform_command_str, algorithm)?;
@@ -238,6 +248,7 @@ impl FileHasher<'_> {
             cache: Some(cache),
             transform,
             log,
+            cancel_token,
         })
     }
 
@@ -260,20 +271,21 @@ impl FileHasher<'_> {
             progress(chunk.len.0 as usize);
             return Ok(hash);
         }
+        let cancel_token = self.cancel_token.as_ref();
         let hash = match self.algorithm {
-            HashFn::Metro => file_hash::<MetroHash128>(chunk, self.buf_len, progress),
+            HashFn::Metro => file_hash::<MetroHash128>(chunk, self.buf_len, cancel_token, progress),
             #[cfg(feature = "xxhash")]
-            HashFn::Xxhash => file_hash::<Xxh3>(chunk, self.buf_len, progress),
+            HashFn::Xxhash => file_hash::<Xxh3>(chunk, self.buf_len, cancel_token, progress),
             #[cfg(feature = "blake3")]
-            HashFn::Blake3 => file_hash::<blake3::Hasher>(chunk, self.buf_len, progress),
+            HashFn::Blake3 => file_hash::<blake3::Hasher>(chunk, self.buf_len, cancel_token, progress),
             #[cfg(feature = "sha2")]
-            HashFn::Sha256 => file_hash::<Sha256>(chunk, self.buf_len, progress),
+            HashFn::Sha256 => file_hash::<Sha256>(chunk, self.buf_len, cancel_token, progress),
             #[cfg(feature = "sha2")]
-            HashFn::Sha512 => file_hash::<Sha512>(chunk, self.buf_len, progress),
+            HashFn::Sha512 => file_hash::<Sha512>(chunk, self.buf_len, cancel_token, progress),
             #[cfg(feature = "sha3")]
-            HashFn::Sha3_256 => file_hash::<Sha3_256>(chunk, self.buf_len, progress),
+            HashFn::Sha3_256 => file_hash::<Sha3_256>(chunk, self.buf_len, cancel_token, progress),
             #[cfg(feature = "sha3")]
-            HashFn::Sha3_512 => file_hash::<Sha3_512>(chunk, self.buf_len, progress),
+            HashFn::Sha3_512 => file_hash::<Sha3_512>(chunk, self.buf_len, cancel_token, progress),
         }?;
         self.store_hash(key, metadata, chunk.len, hash.clone());
         Ok(hash)
@@ -324,24 +336,25 @@ impl FileHasher<'_> {
         let mut transform_output = transform.run(chunk.path)?;
         let stream = &mut transform_output.out_stream;
         let buf_len = self.buf_len;
+        let cancel_token = self.cancel_token.as_ref();
 
         // Transformed file may have a different length, so we cannot use stream_hash progress
         // reporting, as it would report progress of the transformed stream. Instead we advance
         // progress after doing the full file.
         let hash = match self.algorithm {
-            HashFn::Metro => stream_hash::<MetroHash128>(stream, chunk.len, buf_len, |_| {}),
+            HashFn::Metro => stream_hash::<MetroHash128>(stream, chunk.len, buf_len, cancel_token, |_| {}),
             #[cfg(feature = "xxhash")]
-            HashFn::Xxhash => stream_hash::<Xxh3>(stream, chunk.len, buf_len, |_| {}),
+            HashFn::Xxhash => stream_hash::<Xxh3>(stream, chunk.len, buf_len, cancel_token, |_| {}),
             #[cfg(feature = "blake3")]
-            HashFn::Blake3 => stream_hash::<blake3::Hasher>(stream, chunk.len, buf_len, |_| {}),
+            HashFn::Blake3 => stream_hash::<blake3::Hasher>(stream, chunk.len, buf_len, cancel_token, |_| {}),
             #[cfg(feature = "sha2")]
-            HashFn::Sha256 => stream_hash::<Sha256>(stream, chunk.len, buf_len, |_| {}),
+            HashFn::Sha256 => stream_hash::<Sha256>(stream, chunk.len, buf_len, cancel_token, |_| {}),
             #[cfg(feature = "sha2")]
-            HashFn::Sha512 => stream_hash::<Sha512>(stream, chunk.len, buf_len, |_| {}),
+            HashFn::Sha512 => stream_hash::<Sha512>(stream, chunk.len, buf_len, cancel_token, |_| {}),
             #[cfg(feature = "sha3")]
-            HashFn::Sha3_256 => stream_hash::<Sha3_256>(stream, chunk.len, buf_len, |_| {}),
+            HashFn::Sha3_256 => stream_hash::<Sha3_256>(stream, chunk.len, buf_len, cancel_token, |_| {}),
             #[cfg(feature = "sha3")]
-            HashFn::Sha3_512 => stream_hash::<Sha3_512>(stream, chunk.len, buf_len, |_| {}),
+            HashFn::Sha3_512 => stream_hash::<Sha3_512>(stream, chunk.len, buf_len, cancel_token, |_| {}),
         };
         progress(chunk.len.0 as usize);
 
@@ -574,6 +587,7 @@ fn scan<F: FnMut(&[u8])>(
     stream: &mut impl Read,
     len: FileLen,
     buf_len: usize,
+    cancel_token: Option<&Arc<AtomicBool>>,
     mut consumer: F,
 ) -> io::Result<u64> {
     BUF.with(|buf| {
@@ -583,6 +597,12 @@ fn scan<F: FnMut(&[u8])>(
         let mut read: u64 = 0;
         let len = len.into();
         while read < len {
+            // Check for cancellation every iteration (~64KB)
+            if let Some(token) = cancel_token {
+                if token.load(Ordering::SeqCst) {
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "Cancelled"));
+                }
+            }
             let remaining = len - read;
             let to_read = min(remaining, buf.len() as u64) as usize;
             let buf = &mut buf[..to_read];
@@ -607,11 +627,12 @@ fn stream_hash<H: StreamHasher>(
     stream: &mut impl Read,
     len: FileLen,
     buf_len: usize,
+    cancel_token: Option<&Arc<AtomicBool>>,
     progress: impl Fn(usize),
 ) -> io::Result<(FileLen, FileHash)> {
     let mut hasher = H::new();
     let mut read_len: FileLen = FileLen(0);
-    scan(stream, len, buf_len, |buf| {
+    scan(stream, len, buf_len, cancel_token, |buf| {
         hasher.update(buf);
         read_len += FileLen(buf.len() as u64);
         (progress)(buf.len());
@@ -625,6 +646,7 @@ fn stream_hash<H: StreamHasher>(
 fn file_hash<H: StreamHasher>(
     chunk: &FileChunk<'_>,
     buf_len: usize,
+    cancel_token: Option<&Arc<AtomicBool>>,
     progress: impl Fn(usize),
 ) -> io::Result<FileHash> {
     let access = if chunk.len.0 < 64 * 1024 {
@@ -633,7 +655,7 @@ fn file_hash<H: StreamHasher>(
         FileAccess::Sequential
     };
     let mut file = open(chunk.path, chunk.pos, chunk.len, access)?;
-    let hash = stream_hash::<H>(&mut file, chunk.len, buf_len, progress)?.1;
+    let hash = stream_hash::<H>(&mut file, chunk.len, buf_len, cancel_token, progress)?.1;
     evict_page_cache_if_low_mem(&mut file, chunk.len);
     Ok(hash)
 }
@@ -661,9 +683,9 @@ mod test {
         let chunk2 = FileChunk::new(&file2, FilePos(0), FileLen::MAX);
         let chunk3 = FileChunk::new(&file2, FilePos(0), FileLen(8));
 
-        let hash1 = file_hash::<H>(&chunk1, 4096, |_| {}).unwrap();
-        let hash2 = file_hash::<H>(&chunk2, 4096, |_| {}).unwrap();
-        let hash3 = file_hash::<H>(&chunk3, 4096, |_| {}).unwrap();
+        let hash1 = file_hash::<H>(&chunk1, 4096, None, |_| {}).unwrap();
+        let hash2 = file_hash::<H>(&chunk2, 4096, None, |_| {}).unwrap();
+        let hash3 = file_hash::<H>(&chunk3, 4096, None, |_| {}).unwrap();
 
         assert_ne!(hash1, hash2);
         assert_ne!(hash2, hash3);

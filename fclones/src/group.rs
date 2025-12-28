@@ -13,7 +13,7 @@ use std::io;
 use std::io::BufWriter;
 use std::iter::FromIterator;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
@@ -143,9 +143,9 @@ impl<'a> GroupCtx<'a> {
             .path_selector(&base_dir)
             .map_err(|e| format!("Invalid pattern: {e}"))?;
         let hasher = if config.cache {
-            FileHasher::new_cached(config.hash_fn, transform, log)?
+            FileHasher::new_cached(config.hash_fn, transform, log, config.cancel_token.clone())?
         } else {
-            FileHasher::new(config.hash_fn, transform, log)
+            FileHasher::new(config.hash_fn, transform, log, config.cancel_token.clone())
         };
 
         Self::check_pool_config(thread_pool_sizes, &devices)?;
@@ -567,12 +567,20 @@ fn rehash<'a, F1, F2, H>(
     devices: &DiskDevices,
     access_type: FileAccess,
     hash_fn: H,
+    cancel_token: Option<Arc<AtomicBool>>,
 ) -> Vec<FileGroup<FileInfo>>
 where
     F1: Fn(&FileGroup<FileInfo>) -> bool,
     F2: Fn(&FileGroup<FileInfo>) -> bool,
     H: Fn((&mut FileInfo, FileHash)) -> Option<FileHash> + Sync + Send + 'a,
 {
+    // Helper to check cancellation
+    let is_cancelled = || {
+        cancel_token
+            .as_ref()
+            .map(|t| t.load(Ordering::SeqCst))
+            .unwrap_or(false)
+    };
     // Allow sharing the hash function between threads:
     type HashFn<'a> = dyn Fn((&mut FileInfo, FileHash)) -> Option<FileHash> + Sync + Send + 'a;
     let hash_fn: &HashFn<'a> = &hash_fn;
@@ -630,6 +638,10 @@ where
                 // Run hashing on the thread-pool dedicated to the device.
                 // Group files by their identifiers so we hash only one file per unique id.
                 for (_, fg) in &files.into_iter().group_by(|f| f.file_info.id) {
+                    // Check for cancellation before spawning more work
+                    if is_cancelled() {
+                        break;
+                    }
                     let mut fg = fg.collect_vec();
                     let tx = tx.clone();
                     let guard = semaphore.clone().access_owned();
@@ -711,6 +723,7 @@ fn scan_files(ctx: &GroupCtx<'_>) -> Vec<Vec<FileInfo>> {
     walk.path_selector = ctx.path_selector.clone();
     walk.log = Some(ctx.log);
     walk.on_visit = spinner_tick;
+    walk.cancel_token = config.cancel_token.clone();
     walk.run(ctx.config.input_paths(), |path| {
         file_info_or_log_err(path, &ctx.devices, ctx.log)
             .into_iter()
@@ -977,6 +990,7 @@ fn group_transformed(ctx: &GroupCtx<'_>, files: Vec<FileInfo>) -> Vec<FileGroup<
             progress.inc(1);
             result
         },
+        ctx.config.cancel_token.clone(),
     );
 
     let stats = stage_stats(&groups, &ctx.group_filter);
@@ -1045,6 +1059,7 @@ fn group_by_prefix(
             let chunk = FileChunk::new(&fi.path, FilePos(0), prefix_len);
             ctx.hasher.hash_file_or_log_err(&chunk, |_| {})
         },
+        ctx.config.cancel_token.clone(),
     );
 
     let stats = stage_stats(&groups, &ctx.group_filter);
@@ -1105,6 +1120,7 @@ fn group_by_suffix(
                 .hash_file_or_log_err(&chunk, |_| {})
                 .map(|new_hash| old_hash ^ new_hash)
         },
+        ctx.config.cancel_token.clone(),
     );
 
     let stats = stage_stats(&groups, &ctx.group_filter);
@@ -1141,6 +1157,7 @@ fn group_by_contents(
             ctx.hasher
                 .hash_file_or_log_err(&chunk, |bytes_read| progress.inc(bytes_read as u64))
         },
+        ctx.config.cancel_token.clone(),
     );
 
     let stats = stage_stats(&groups, &ctx.group_filter);
@@ -1396,6 +1413,7 @@ mod test {
             &devices,
             FileAccess::Random,
             |(fi, _)| Some(FileHash::from(fi.location as u128)),
+            None,
         );
 
         assert_eq!(result.len(), 2);
@@ -1443,6 +1461,7 @@ mod test {
                 hash_call_count.fetch_add(1, Ordering::Relaxed);
                 Some(FileHash::from(fi.location as u128))
             },
+            None,
         );
 
         assert_eq!(result.len(), 1);
@@ -1491,6 +1510,7 @@ mod test {
             &devices,
             FileAccess::Random,
             |(_, _)| Some(FileHash::from(123456)),
+            None,
         );
 
         assert_eq!(result.len(), 1);
@@ -1525,6 +1545,7 @@ mod test {
                 called.store(true, Ordering::Release);
                 Some(FileHash::from(fi.location as u128))
             },
+            None,
         );
 
         assert_eq!(result.len(), 1);
@@ -1566,6 +1587,7 @@ mod test {
             &devices,
             FileAccess::Random,
             |(fi, _)| Some(FileHash::from(fi.location as u128)),
+            None,
         );
 
         assert!(result.is_empty())
@@ -1605,6 +1627,7 @@ mod test {
                 processing_order.lock().unwrap().push(fi.location as i32);
                 Some(FileHash::from(fi.location as u128))
             },
+            None,
         );
         let processing_order = processing_order.into_inner().unwrap();
 
