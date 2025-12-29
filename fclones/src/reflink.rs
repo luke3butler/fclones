@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs;
 use std::fs::Metadata;
 use std::io;
@@ -6,6 +8,28 @@ use filetime::FileTime;
 
 use crate::dedupe::{FsCommand, PathAndMetadata};
 use crate::log::{Log, LogExt};
+
+// Thread-local storage for tracking skipped xattrs during deduplication.
+// This allows us to count protected xattrs that couldn't be removed/set
+// without changing function signatures throughout the codebase.
+#[cfg(unix)]
+thread_local! {
+    static SKIPPED_XATTRS: RefCell<HashMap<String, u32>> = RefCell::new(HashMap::new());
+}
+
+/// Returns and clears the count of skipped xattrs since last drain.
+/// Keys are xattr names, values are skip counts.
+/// Call this after a batch of deduplication operations to get the summary.
+#[cfg(unix)]
+pub fn drain_skipped_xattrs() -> HashMap<String, u32> {
+    SKIPPED_XATTRS.with(|m| std::mem::take(&mut *m.borrow_mut()))
+}
+
+/// Non-unix stub that returns empty map.
+#[cfg(not(unix))]
+pub fn drain_skipped_xattrs() -> HashMap<String, u32> {
+    HashMap::new()
+}
 
 #[cfg(unix)]
 struct XAttr {
@@ -274,8 +298,16 @@ fn restore_xattrs(path: &std::path::Path, xattrs: Vec<XAttr>) -> io::Result<()> 
     use xattr::FileExt;
     let file = fs::File::open(path)?;
     for name in file.list_xattr()? {
-        file.remove_xattr(&name).map_err(|e| {
-            io::Error::new(
+        if let Err(e) = file.remove_xattr(&name) {
+            // On macOS, protected xattrs (com.apple.quarantine, com.apple.rootless)
+            // cannot be removed by sandboxed apps. Continue gracefully.
+            if e.kind() == io::ErrorKind::PermissionDenied {
+                SKIPPED_XATTRS.with(|m| {
+                    *m.borrow_mut().entry(name.to_string_lossy().into_owned()).or_insert(0) += 1;
+                });
+                continue;
+            }
+            return Err(io::Error::new(
                 e.kind(),
                 format!(
                     "Failed to clear extended attribute {} of {}: {}",
@@ -283,13 +315,21 @@ fn restore_xattrs(path: &std::path::Path, xattrs: Vec<XAttr>) -> io::Result<()> 
                     path.display(),
                     e
                 ),
-            )
-        })?;
+            ));
+        }
     }
     for attr in xattrs {
         if let Some(value) = attr.value {
-            file.set_xattr(&attr.name, &value).map_err(|e| {
-                io::Error::new(
+            if let Err(e) = file.set_xattr(&attr.name, &value) {
+                // On macOS, some xattrs may be protected and cannot be set.
+                // Continue gracefully to avoid failing the entire operation.
+                if e.kind() == io::ErrorKind::PermissionDenied {
+                    SKIPPED_XATTRS.with(|m| {
+                        *m.borrow_mut().entry(attr.name.to_string_lossy().into_owned()).or_insert(0) += 1;
+                    });
+                    continue;
+                }
+                return Err(io::Error::new(
                     e.kind(),
                     format!(
                         "Failed to set extended attribute {} of {}: {}",
@@ -297,8 +337,8 @@ fn restore_xattrs(path: &std::path::Path, xattrs: Vec<XAttr>) -> io::Result<()> 
                         path.display(),
                         e
                     ),
-                )
-            })?;
+                ));
+            }
         }
     }
     Ok(())

@@ -34,5 +34,6 @@ pub use error::Error;
 pub use file::{FileHash, FileId, FileInfo, FileLen};
 pub use group::{group_files, write_report, FileGroup, FileSubGroup};
 pub use path::Path;
+pub use reflink::drain_skipped_xattrs;
 
 const TIMESTAMP_FMT: &str = "%Y-%m-%d %H:%M:%S.%3f %z";
